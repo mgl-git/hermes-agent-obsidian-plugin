@@ -23,7 +23,8 @@ import {
   parseContextLengthCache,
   sanitizeProfileName,
   profileBaseUrl,
-  approvalRequestFromEvent
+  approvalRequestFromEvent,
+  approvalResponseBody
 } from "./.build/protocol.mjs";
 
 test("parseSseBlock parses data-only blocks with CRLF", () => {
@@ -231,4 +232,12 @@ test("approvalRequestFromEvent reads command, reason and offered choices", () =>
   });
   assert.deepEqual(r, { command: "rm notes/old.md", description: "dangerous command", choices: ["once", "session", "deny"] });
   assert.deepEqual(approvalRequestFromEvent({}).choices, ["once", "deny"]);
+});
+
+test("approvalResponseBody matches the gateway mode", () => {
+  const authority = approvalRequestFromEvent({ command: "rm -rf x", request_id: "p1", execution_generation: 3, choices: ["once", "deny"] });
+  assert.deepEqual(approvalResponseBody(authority, "once"), { request_id: "p1", execution_generation: 3, choice: "once" });
+  const legacy = approvalRequestFromEvent({ command: "rm -rf x" });
+  assert.deepEqual(approvalResponseBody(legacy, "always"), { choice: "always", resolve_all: true });
+  assert.deepEqual(approvalResponseBody(null, "deny"), { choice: "deny", resolve_all: false });
 });

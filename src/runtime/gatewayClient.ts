@@ -29,6 +29,7 @@ import {
   ApprovalChoice,
   ApprovalRequest,
   approvalRequestFromEvent,
+  approvalResponseBody,
   parseSseBlock,
   profileBaseUrl,
   runCompletedUsage,
@@ -572,7 +573,7 @@ export class HermesGatewayClient {
           });
           // Respond "always" + resolve_all so repeated identical requests don't
           // re-prompt; keep listening on the existing event stream.
-          this.postRunApproval(apiUrl, runId, "always");
+          void this.postRunApproval(apiUrl, runId, "always", approvalRequestFromEvent(raw));
           return;
         }
         // Manual mode with an approval UI: ask the user, then answer the run.
@@ -590,7 +591,11 @@ export class HermesGatewayClient {
                 status: "completed",
                 preview: `${choice === "deny" ? "denied" : `approved (${choice})`}${request.command ? `: ${request.command}` : ""}`
               });
-              this.postRunApproval(apiUrl, runId, choice);
+              void this.postRunApproval(apiUrl, runId, choice, request).then((err) => {
+                if (err && !isAborted()) {
+                  cb.onToolEvent?.({ name: "approval", status: "failed", preview: `gateway rejected the answer: ${err}` });
+                }
+              });
               if (reopenAfterApproval) {
                 reopenAfterApproval = false;
                 openEventStream(runId);
@@ -732,14 +737,34 @@ export class HermesGatewayClient {
     this.postQuietly(`${apiUrl}/v1/runs/${encodeURIComponent(runId)}/stop`);
   }
 
-  /** Answer a pending tool-approval request for a run. */
-  private postRunApproval(apiUrl: string, runId: string, choice: ApprovalChoice): void {
-    // "always"/"session" also settle identical pending requests; a single
-    // "once"/"deny" answers only the request the user saw.
-    const resolveAll = choice === "always" || choice === "session";
-    this.postQuietly(`${apiUrl}/v1/runs/${encodeURIComponent(runId)}/approval`, {
-      choice,
-      resolve_all: resolveAll
-    });
+  /**
+   * Answer a pending tool-approval request for a run. Resolves with an error
+   * message when the gateway refuses the answer, otherwise with "".
+   */
+  private async postRunApproval(
+    apiUrl: string,
+    runId: string,
+    choice: ApprovalChoice,
+    request: ApprovalRequest | null = null
+  ): Promise<string> {
+    const url = `${apiUrl}/v1/runs/${encodeURIComponent(runId)}/approval`;
+    try {
+      const res = await requestOnce(this.transport, url, {
+        method: "POST",
+        headers: { "Content-Type": "application/json", ...this.authHeaders() },
+        body: JSON.stringify(approvalResponseBody(request, choice)),
+        timeoutMs: 15000
+      });
+      if (res.status >= 200 && res.status < 300) return "";
+      try {
+        const parsed = JSON.parse(res.body) as { error?: { message?: unknown } };
+        if (typeof parsed.error?.message === "string") return `${res.status} ${parsed.error.message}`;
+      } catch {
+        /* not JSON */
+      }
+      return `HTTP ${res.status}`;
+    } catch (e) {
+      return (e as Error)?.message || String(e);
+    }
   }
 }
