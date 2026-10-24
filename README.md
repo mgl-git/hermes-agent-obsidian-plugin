@@ -6,6 +6,50 @@ a multi-tab sidebar panel. It sends the current note or selected text as context
 
 It is a separate plugin from Claudian and does not modify or replace it.
 
+## About this fork
+
+This fork makes the Hermes Agent plugin run on **Obsidian Mobile** (iPad, iPhone, Android) and adds a few things you need once Hermes runs on another machine than the one you are typing on. **Desktop behaviour is unchanged**: with default settings the plugin works exactly like upstream.
+
+The changes live on the branch [`mobile-support`](../../tree/mobile-support) as small, separate commits and are offered upstream as a pull request. Until they are merged, install this fork with BRAT (see below).
+
+### What's new
+
+- **Runs on mobile.** A new network layer uses Node `http/https` on desktop (as before) and `fetch` with a streamed response on mobile, so replies still arrive token by token. If the gateway sends no CORS headers, it falls back to Obsidian's `requestUrl` (works, but without streaming). Node modules are loaded lazily, so the bundle starts on iOS.
+- **Remote and multi-profile gateways.** A *Profile* setting sends requests to `/p/<profile>/` on a gateway that serves several Hermes profiles, each with its own API key. Several people (or devices) can share one Hermes server without seeing each other's sessions.
+- **Approval dialog.** With *Auto-approve tool requests* off, every command the gateway flags as dangerous (e.g. `rm -rf`, `sudo`) opens a dialog: *Allow once*, *Allow for this chat*, *Always allow* or *Deny*. Closing the dialog counts as *Deny*. Previously the plugin cancelled the run instead. Works on desktop and mobile.
+- **Session-authority gateways.** Approvals and stops are answered in the format current Hermes gateways require (`request_id` / `prompt_id` + `execution_generation`, `admission_id`); older gateways keep the previous format.
+- **Stop really stops.** Stopping a chat now also stops the run on the gateway, so a run that waits for an approval no longer blocks the next message in that chat.
+- **Visible failures.** If the gateway refuses an approval answer, the chat says so instead of waiting silently.
+- **Tests** for the new protocol helpers (69 in total, all passing).
+
+### Install with BRAT
+
+1. Install and enable the community plugin **BRAT** (Obsidian42).
+2. BRAT → *Add beta plugin* → `mgl-git/hermes-agent-obsidian-plugin` → version **Latest**.
+3. Enable *Hermes Agent*. Existing settings and chat history are kept; new settings start empty, which means "behave as before".
+
+### Using a remote gateway from a phone or tablet
+
+- Serve the gateway over **HTTPS** (iOS blocks plain `http://` to other hosts), e.g. `tailscale serve --https=8443 http://127.0.0.1:8642`, and use that URL as *Gateway base URL*.
+- Allow the Obsidian app origins via CORS in the gateway's `.env`:
+  `API_SERVER_CORS_ORIGINS=app://obsidian.md,capacitor://localhost,http://localhost`
+- Multi-profile gateway: set *Profile* and that profile's own `API_SERVER_KEY` (in the profile's `.env`). A profile key only opens its own profile.
+- *Working folder*: leave empty on mobile; on desktop with a remote gateway, set it to the path where the gateway sees the vault (e.g. `/workspace`), otherwise the agent is told a local path it cannot reach.
+
+### Security notes
+
+- No addresses, keys or other credentials are in the code; everything is entered in the plugin settings.
+- The settings (including the API key) are stored in `.obsidian/plugins/hermes-agent/data.json` inside the vault and travel with your vault sync. Use a per-profile key, not the owner's key, on shared or less trusted devices.
+- Restrict network access to the gateway port (for example with a Tailscale ACL that lets a tagged device reach only that port), and keep *Auto-approve* off where people should confirm dangerous commands.
+
+### Tested with
+
+Hermes Agent v0.22.3 (multiplex gateway with session authority, Docker terminal backend), Obsidian desktop on Windows and Obsidian on iPadOS, gateway reached over Tailscale HTTPS.
+
+### License
+
+MIT, unchanged from upstream. Original work © Jason ([jsun2020](https://github.com/jsun2020/hermes-agent-obsidian-plugin)); mobile and gateway changes contributed under the same license.
+
 ## How it works
 
 - Hermes Desktop runs a local **gateway** (default `http://127.0.0.1:8642`).
