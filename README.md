@@ -10,7 +10,7 @@ It is a separate plugin from Claudian and does not modify or replace it.
 
 This fork makes the Hermes Agent plugin run on **Obsidian Mobile** (iPad, iPhone, Android) and adds a few things you need once Hermes runs on another machine than the one you are typing on. **Desktop behaviour is unchanged**: with default settings the plugin works exactly like upstream.
 
-The changes live on the branch [`mobile-support`](../../tree/mobile-support) as small, separate commits and are offered upstream as a pull request. Until they are merged, install this fork with BRAT (see below).
+The changes live on the branch [`mobile-support`](../../tree/mobile-support) as small, separate commits and are offered upstream as [pull request #22](https://github.com/jsun2020/hermes-agent-obsidian-plugin/pull/22). Until they are merged, install this fork with BRAT (see below).
 
 ### What's new
 
