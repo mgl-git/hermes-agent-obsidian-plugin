@@ -267,3 +267,37 @@ export function greetingOptions(userName: string): string[] {
     name ? `Hi ${name}, how can I help?` : "How can I help you today?"
   ];
 }
+
+// ---- approvals + multi-profile gateways -----------------------------------
+
+export type ApprovalChoice = "once" | "session" | "always" | "deny";
+
+export interface ApprovalRequest {
+  /** What the agent wants to run (already redacted by the gateway). */
+  command: string;
+  /** Why the gateway flagged it, when provided. */
+  description: string;
+  /** Answers the gateway accepts for this request. */
+  choices: ApprovalChoice[];
+}
+
+/** Read an `approval.request` run event into an ApprovalRequest. */
+export function approvalRequestFromEvent(raw: Record<string, unknown>): ApprovalRequest {
+  const all: ApprovalChoice[] = ["once", "session", "always", "deny"];
+  const offered = Array.isArray(raw.choices)
+    ? all.filter((c) => (raw.choices as unknown[]).includes(c))
+    : [];
+  const text = (v: unknown) => (typeof v === "string" ? v : "");
+  return {
+    command: text(raw.command),
+    description: text(raw.description) || text(raw.reason) || text(raw.pattern_key),
+    choices: offered.length ? offered : ["once", "deny"]
+  };
+}
+
+/** Base URL plus the optional `/p/<profile>` prefix of a multi-profile gateway. */
+export function profileBaseUrl(baseUrl: string, profile: string | undefined): string {
+  const base = normaliseBaseUrl(baseUrl);
+  const name = (profile || "").trim().replace(/^\/+|\/+$/g, "").replace(/^p\//, "");
+  return name ? `${base}/p/${encodeURIComponent(name)}` : base;
+}

@@ -21,7 +21,9 @@ import {
   greetingOptions,
   parseConfigModel,
   parseContextLengthCache,
-  sanitizeProfileName
+  sanitizeProfileName,
+  profileBaseUrl,
+  approvalRequestFromEvent
 } from "./.build/protocol.mjs";
 
 test("parseSseBlock parses data-only blocks with CRLF", () => {
@@ -211,4 +213,22 @@ test("sanitizeProfileName rejects traversal, separators, and junk", () => {
   assert.equal(sanitizeProfileName("a\b"), "");
   assert.equal(sanitizeProfileName(".hidden"), "");
   assert.equal(sanitizeProfileName("x".repeat(65)), "");
+});
+
+test("profileBaseUrl adds the /p/<profile> prefix only when a profile is set", () => {
+  assert.equal(profileBaseUrl("https://host:8443/", ""), "https://host:8443");
+  assert.equal(profileBaseUrl("https://host:8443/v1", "work"), "https://host:8443/p/work");
+  assert.equal(profileBaseUrl("http://127.0.0.1:8642", "/p/work/"), "http://127.0.0.1:8642/p/work");
+  assert.equal(profileBaseUrl("http://127.0.0.1:8642", "  "), "http://127.0.0.1:8642");
+});
+
+test("approvalRequestFromEvent reads command, reason and offered choices", () => {
+  const r = approvalRequestFromEvent({
+    event: "approval.request",
+    command: "rm notes/old.md",
+    description: "dangerous command",
+    choices: ["once", "session", "deny", "bogus"]
+  });
+  assert.deepEqual(r, { command: "rm notes/old.md", description: "dangerous command", choices: ["once", "session", "deny"] });
+  assert.deepEqual(approvalRequestFromEvent({}).choices, ["once", "deny"]);
 });

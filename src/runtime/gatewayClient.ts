@@ -11,15 +11,14 @@
 //   [Chat]  POST /v1/chat/completions     -> OpenAI-compatible SSE
 //   GET  /v1/models                       -> model list (test/connect)
 //
-// Auth: Authorization: Bearer <API_SERVER_KEY>. We talk to it from the Node
-// side (Electron renderer with Node integration), exactly as Desktop does, so
-// there is no browser CORS involved and Node's http client ignores the system
-// proxy for loopback addresses.
+// Auth: Authorization: Bearer <API_SERVER_KEY>. A remote gateway serving
+// several profiles is addressed under /p/<profile>/ (settings.profile).
+//
+// The network itself goes through a Transport (see ./transport): Node
+// http/https on desktop (unchanged behaviour), fetch with streaming on mobile.
 
-import * as http from "http";
-import * as https from "https";
-import { randomUUID } from "crypto";
 import { HermesSettings } from "../settings/types";
+import { Transport, createNodeTransport, isTimeoutError, requestOnce } from "./transport";
 import {
   HermesCapabilities,
   ToolEvent,
@@ -27,8 +26,11 @@ import {
   chatCompletionUsage,
   chatDeltaContent,
   contextWindowFor,
-  normaliseBaseUrl,
+  ApprovalChoice,
+  ApprovalRequest,
+  approvalRequestFromEvent,
   parseSseBlock,
+  profileBaseUrl,
   runCompletedUsage,
   runEventReasoningText,
   supportsRunsTransport,
@@ -36,7 +38,7 @@ import {
 } from "./protocol";
 import { buildSystemInstructions, resolveWorkingFolder } from "./context";
 
-export type { HermesCapabilities, ToolEvent, UsageInfo } from "./protocol";
+export type { ApprovalChoice, ApprovalRequest, HermesCapabilities, ToolEvent, UsageInfo } from "./protocol";
 
 export interface ChatMessage {
   role: "user" | "assistant" | "system";
@@ -48,8 +50,20 @@ export interface StreamCallbacks {
   onReasoning?(text: string): void;
   onToolEvent?(event: ToolEvent): void;
   onUsage?(usage: UsageInfo): void;
+  /**
+   * Ask the user to approve a tool call (only when auto-approve is off).
+   * Resolve with the chosen answer; without this callback the run is stopped
+   * and the reply falls back to a plain, tool-less chat completion.
+   */
+  onApprovalRequest?(request: ApprovalRequest): Promise<ApprovalChoice>;
   onError(message: string): void;
   onDone(sessionId?: string): void;
+}
+
+function newSessionId(): string {
+  const c = (globalThis as { crypto?: { randomUUID?: () => string } }).crypto;
+  const id = c?.randomUUID ? c.randomUUID() : `${Math.random().toString(36).slice(2)}${Math.random().toString(36).slice(2)}`;
+  return `obs-${Date.now()}-${id}`;
 }
 
 export interface ChatHandle {
@@ -68,7 +82,7 @@ export interface TestResult {
 interface RawResponse {
   status: number;
   body: string;
-  headers: http.IncomingHttpHeaders;
+  headers: Record<string, string>;
 }
 
 export class HermesGatewayClient {
@@ -76,11 +90,13 @@ export class HermesGatewayClient {
 
   constructor(
     private getSettings: () => HermesSettings,
-    private getVaultBasePath: () => string = () => ""
+    private getVaultBasePath: () => string = () => "",
+    private transport: Transport = createNodeTransport()
   ) {}
 
   private base(): string {
-    return normaliseBaseUrl(this.getSettings().baseUrl);
+    const s = this.getSettings();
+    return profileBaseUrl(s.baseUrl, s.profile);
   }
 
   /** Absolute path of the agent's working folder (vault root or configured sub-folder). */
@@ -107,9 +123,6 @@ export class HermesGatewayClient {
     return key ? { Authorization: `Bearer ${key}` } : {};
   }
 
-  private requester(url: string): typeof http | typeof https {
-    return url.startsWith("https") ? https : http;
-  }
 
   /** One-shot (non-streaming) JSON request used for capabilities/models. */
   private async jsonRequest(
@@ -119,27 +132,10 @@ export class HermesGatewayClient {
     timeoutMs = 8000
   ): Promise<RawResponse> {
     const url = `${this.base()}${path}`;
-    const payload = body === undefined ? undefined : Buffer.from(JSON.stringify(body), "utf-8");
+    const payload = body === undefined ? undefined : JSON.stringify(body);
     const headers: Record<string, string> = { ...this.authHeaders() };
-    if (payload) {
-      headers["Content-Type"] = "application/json";
-      headers["Content-Length"] = String(payload.length);
-    }
-    return new Promise<RawResponse>((resolve, reject) => {
-      const req = this.requester(url).request(url, { method, headers, timeout: timeoutMs }, (res) => {
-        let raw = "";
-        res.on("data", (c: Buffer) => (raw += c.toString()));
-        res.on("end", () =>
-          resolve({ status: res.statusCode || 0, body: raw, headers: res.headers })
-        );
-      });
-      req.on("error", reject);
-      req.on("timeout", () => {
-        req.destroy(new Error("request timed out"));
-      });
-      if (payload) req.write(payload);
-      req.end();
-    });
+    if (payload !== undefined) headers["Content-Type"] = "application/json";
+    return requestOnce(this.transport, url, { method, headers, body: payload, timeoutMs });
   }
 
   async getCapabilities(force = false): Promise<HermesCapabilities | null> {
@@ -363,13 +359,12 @@ export class HermesGatewayClient {
     if (resumeSessionId) bodyObj.session_id = resumeSessionId;
     if (s.reasoningEffort) bodyObj.reasoning_effort = s.reasoningEffort;
 
-    const payload = Buffer.from(JSON.stringify(bodyObj), "utf-8");
+    const payload = JSON.stringify(bodyObj);
     const headers: Record<string, string> = {
       "Content-Type": "application/json",
-      "Content-Length": String(payload.length),
       ...this.authHeaders()
     };
-    let sessionId = resumeSessionId || (headers.Authorization ? `obs-${Date.now()}-${randomUUID()}` : "");
+    let sessionId = resumeSessionId || (headers.Authorization ? newSessionId() : "");
     if (sessionId) headers["X-Hermes-Session-Id"] = sessionId;
 
     const url = `${this.base()}/v1/chat/completions`;
@@ -397,41 +392,50 @@ export class HermesGatewayClient {
       return false;
     };
 
-    const req = this.requester(url).request(
+    let status = 0;
+    let buffer = "";
+    let errBody = "";
+    let stop = false;
+    const req = this.transport.stream(
       url,
-      { method: "POST", headers, timeout: s.requestTimeoutMs },
-      (res) => {
-        const sid = res.headers["x-hermes-session-id"];
-        if (typeof sid === "string" && sid) sessionId = sid;
-
-        if (res.statusCode !== 200) {
-          let errBody = "";
-          res.on("data", (d: Buffer) => (errBody += d.toString()));
-          res.on("end", () => {
-            try {
-              const err = JSON.parse(errBody) as { error?: { message?: unknown } };
-              const m = err.error?.message;
-              finish(typeof m === "string" ? m : `API error ${res.statusCode}`);
-            } catch {
-              finish(`Gateway returned ${res.statusCode}: ${errBody.slice(0, 200)}`);
-            }
-          });
-          return;
-        }
-
-        let buffer = "";
-        res.on("data", (chunk: Buffer) => {
-          buffer += chunk.toString();
+      { method: "POST", headers, body: payload, timeoutMs: s.requestTimeoutMs },
+      {
+        onResponse: (code, resHeaders) => {
+          status = code;
+          const sid = resHeaders["x-hermes-session-id"];
+          if (sid) sessionId = sid;
+        },
+        onData: (text) => {
+          if (stop) return;
+          if (status !== 200) {
+            errBody += text;
+            return;
+          }
+          buffer += text;
           const parts = buffer.split("\n\n");
           buffer = parts.pop() || "";
           for (const part of parts) {
             const parsed = parseSseBlock(part);
             if (!parsed) continue;
             if (parsed.eventType) continue; // custom (tool-progress) events — ignore for now
-            if (processData(parsed.data)) return;
+            if (processData(parsed.data)) {
+              stop = true;
+              return;
+            }
           }
-        });
-        res.on("end", () => {
+        },
+        onEnd: () => {
+          if (stop) return;
+          if (status !== 200) {
+            try {
+              const err = JSON.parse(errBody) as { error?: { message?: unknown } };
+              const m = err.error?.message;
+              finish(typeof m === "string" ? m : `API error ${status}`);
+            } catch {
+              finish(`Gateway returned ${status}: ${errBody.slice(0, 200)}`);
+            }
+            return;
+          }
           if (buffer.trim()) {
             for (const part of buffer.split("\n\n")) {
               const parsed = parseSseBlock(part);
@@ -439,24 +443,16 @@ export class HermesGatewayClient {
             }
           }
           finish(hasContent ? undefined : lastError || undefined, sessionId);
-        });
-        res.on("error", (err) => {
+        },
+        onError: (err) => {
           if (isAborted() || err.name === "AbortError" || err.message === "aborted") return;
-          finish(`Stream error: ${err.message}`);
-        });
+          if (isTimeoutError(err)) finish("Request timed out.");
+          else if (status) finish(`Stream error: ${err.message}`);
+          else finish(`API request failed: ${err.message}`);
+        }
       }
     );
     reqs.push(req);
-    req.on("error", (err) => {
-      if (isAborted() || err.name === "AbortError") return;
-      finish(`API request failed: ${err.message}`);
-    });
-    req.on("timeout", () => {
-      req.destroy();
-      if (!isAborted()) finish("Request timed out.");
-    });
-    req.write(payload);
-    req.end();
   }
 
   // ---- Runs transport ----
@@ -473,7 +469,7 @@ export class HermesGatewayClient {
     const s = this.getSettings();
     const apiUrl = this.base();
     const auth = this.authHeaders();
-    const sessionId = resumeSessionId || (auth.Authorization ? `obs-${Date.now()}-${randomUUID()}` : "");
+    const sessionId = resumeSessionId || (auth.Authorization ? newSessionId() : "");
 
     const bodyObj: Record<string, unknown> = {
       input,
@@ -499,10 +495,9 @@ export class HermesGatewayClient {
     if (s.reasoningEffort) bodyObj.reasoning_effort = s.reasoningEffort;
     if (sessionId) bodyObj.session_id = sessionId;
 
-    const payload = Buffer.from(JSON.stringify(bodyObj), "utf-8");
+    const payload = JSON.stringify(bodyObj);
     const headers: Record<string, string> = {
       "Content-Type": "application/json",
-      "Content-Length": String(payload.length),
       ...auth
     };
     if (sessionId) headers["X-Hermes-Session-Id"] = sessionId;
@@ -510,6 +505,10 @@ export class HermesGatewayClient {
     let runId = "";
     let hasContent = false;
     let fellBack = false;
+    // Set while the user is answering an approval prompt: an idle timeout of
+    // the event stream during that wait is expected and reopens the stream.
+    let awaitingApproval = false;
+    let reopenAfterApproval = false;
 
     const fallback = () => {
       if (fellBack || isAborted()) return;
@@ -576,7 +575,30 @@ export class HermesGatewayClient {
           this.postRunApproval(apiUrl, runId, "always");
           return;
         }
-        // Manual mode: no approval UI, so cancel + fall back to a plain reply.
+        // Manual mode with an approval UI: ask the user, then answer the run.
+        if (runId && cb.onApprovalRequest) {
+          const request = approvalRequestFromEvent(raw);
+          awaitingApproval = true;
+          cb.onToolEvent?.({ name: "approval", status: "running", preview: request.command || "approval requested" });
+          cb.onApprovalRequest(request)
+            .catch((): ApprovalChoice => "deny")
+            .then((choice) => {
+              awaitingApproval = false;
+              if (isAborted()) return;
+              cb.onToolEvent?.({
+                name: "approval",
+                status: "completed",
+                preview: `${choice === "deny" ? "denied" : `approved (${choice})`}${request.command ? `: ${request.command}` : ""}`
+              });
+              this.postRunApproval(apiUrl, runId, choice);
+              if (reopenAfterApproval) {
+                reopenAfterApproval = false;
+                openEventStream(runId);
+              }
+            });
+          return;
+        }
+        // Manual mode without an approval UI: cancel + fall back to a plain reply.
         if (runId) this.postRunStop(apiUrl, runId);
         fallback();
         return;
@@ -585,17 +607,18 @@ export class HermesGatewayClient {
 
     const openEventStream = (id: string) => {
       const eventsUrl = `${apiUrl}/v1/runs/${encodeURIComponent(id)}/events`;
-      const eventsReq = this.requester(eventsUrl).request(
+      let status = 0;
+      let buffer = "";
+      const eventsReq = this.transport.stream(
         eventsUrl,
-        { method: "GET", headers: auth, timeout: s.requestTimeoutMs },
-        (res) => {
-          if (res.statusCode !== 200) {
-            fallback();
-            return;
-          }
-          let buffer = "";
-          res.on("data", (chunk: Buffer) => {
-            buffer += chunk.toString();
+        { method: "GET", headers: auth, timeoutMs: s.requestTimeoutMs },
+        {
+          onResponse: (code) => {
+            status = code;
+          },
+          onData: (text) => {
+            if (status !== 200) return;
+            buffer += text;
             const parts = buffer.split("\n\n");
             buffer = parts.pop() || "";
             for (const part of parts) {
@@ -607,8 +630,12 @@ export class HermesGatewayClient {
                 /* skip malformed event */
               }
             }
-          });
-          res.on("end", () => {
+          },
+          onEnd: () => {
+            if (status !== 200) {
+              fallback();
+              return;
+            }
             if (buffer.trim()) {
               const parsed = parseSseBlock(buffer);
               if (parsed?.data) {
@@ -619,94 +646,100 @@ export class HermesGatewayClient {
                 }
               }
             }
+            if (awaitingApproval) {
+              reopenAfterApproval = true;
+              return;
+            }
             finish(hasContent ? undefined : undefined, sessionId);
-          });
+          },
+          onError: (err) => {
+            if (isAborted() || err.name === "AbortError") return;
+            if (isTimeoutError(err)) {
+              if (awaitingApproval) {
+                reopenAfterApproval = true;
+                return;
+              }
+              if (!hasContent) fallback();
+              else finish("Run event stream timed out.");
+              return;
+            }
+            if (!hasContent) fallback();
+            else finish(`Run event stream failed: ${err.message}`);
+          }
         }
       );
       reqs.push(eventsReq);
-      eventsReq.on("error", (err) => {
-        if (isAborted() || err.name === "AbortError") return;
-        if (!hasContent) fallback();
-        else finish(`Run event stream failed: ${err.message}`);
-      });
-      eventsReq.on("timeout", () => {
-        eventsReq.destroy();
-        if (!hasContent) fallback();
-        else finish("Run event stream timed out.");
-      });
-      eventsReq.end();
     };
 
     const startUrl = `${apiUrl}/v1/runs`;
-    const startReq = this.requester(startUrl).request(
+    const startReq = this.transport.stream(
       startUrl,
-      { method: "POST", headers, timeout: 30000 },
-      (res) => {
+      { method: "POST", headers, body: payload, timeoutMs: 30000 },
+      (() => {
+        let status = 0;
         let raw = "";
-        res.on("data", (c: Buffer) => (raw += c.toString()));
-        res.on("end", () => {
-          if (res.statusCode !== 200 && res.statusCode !== 202) {
+        return {
+          onResponse: (code: number) => {
+            status = code;
+          },
+          onData: (text: string) => {
+            raw += text;
+          },
+          onEnd: () => {
+            if (status !== 200 && status !== 202) {
+              fallback();
+              return;
+            }
+            try {
+              const parsed = JSON.parse(raw) as { run_id?: unknown };
+              runId = typeof parsed.run_id === "string" ? parsed.run_id : "";
+            } catch {
+              runId = "";
+            }
+            if (!runId) {
+              fallback();
+              return;
+            }
+            openEventStream(runId);
+          },
+          onError: (err: Error) => {
+            if (isAborted() || err.name === "AbortError") return;
             fallback();
-            return;
           }
-          try {
-            const parsed = JSON.parse(raw) as { run_id?: unknown };
-            runId = typeof parsed.run_id === "string" ? parsed.run_id : "";
-          } catch {
-            runId = "";
-          }
-          if (!runId) {
-            fallback();
-            return;
-          }
-          openEventStream(runId);
-        });
-      }
+        };
+      })()
     );
     reqs.push(startReq);
-    startReq.on("error", (err) => {
-      if (isAborted() || err.name === "AbortError") return;
-      fallback();
-    });
-    startReq.on("timeout", () => {
-      startReq.destroy();
-      fallback();
-    });
-    startReq.write(payload);
-    startReq.end();
+  }
+
+  /** Fire-and-forget POST (best effort; errors are ignored). */
+  private postQuietly(url: string, body?: unknown): void {
+    const headers: Record<string, string> = { ...this.authHeaders() };
+    if (body !== undefined) headers["Content-Type"] = "application/json";
+    try {
+      requestOnce(this.transport, url, {
+        method: "POST",
+        headers,
+        ...(body !== undefined ? { body: JSON.stringify(body) } : {}),
+        timeoutMs: 15000
+      }).catch(() => {});
+    } catch {
+      /* best effort */
+    }
   }
 
   private postRunStop(apiUrl: string, runId: string): void {
-    const url = `${apiUrl}/v1/runs/${encodeURIComponent(runId)}/stop`;
-    try {
-      const req = this.requester(url).request(url, { method: "POST", headers: this.authHeaders() });
-      req.on("error", () => {});
-      req.end();
-    } catch {
-      /* best effort */
-    }
+    this.postQuietly(`${apiUrl}/v1/runs/${encodeURIComponent(runId)}/stop`);
   }
 
   /** Answer a pending tool-approval request for a run. */
-  private postRunApproval(
-    apiUrl: string,
-    runId: string,
-    choice: "once" | "session" | "always" | "deny"
-  ): void {
-    const url = `${apiUrl}/v1/runs/${encodeURIComponent(runId)}/approval`;
-    try {
-      const payload = Buffer.from(JSON.stringify({ choice, resolve_all: true }), "utf-8");
-      const headers: Record<string, string> = {
-        "Content-Type": "application/json",
-        "Content-Length": String(payload.length),
-        ...this.authHeaders()
-      };
-      const req = this.requester(url).request(url, { method: "POST", headers });
-      req.on("error", () => {});
-      req.write(payload);
-      req.end();
-    } catch {
-      /* best effort */
-    }
+  private postRunApproval(apiUrl: string, runId: string, choice: ApprovalChoice): void {
+    // "always"/"session" also settle identical pending requests; a single
+    // "once"/"deny" answers only the request the user saw.
+    const resolveAll = choice === "always" || choice === "session";
+    this.postQuietly(`${apiUrl}/v1/runs/${encodeURIComponent(runId)}/approval`, {
+      choice,
+      resolve_all: resolveAll
+    });
   }
 }
