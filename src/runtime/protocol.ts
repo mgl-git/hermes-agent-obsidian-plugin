@@ -292,7 +292,8 @@ export function approvalRequestFromEvent(raw: Record<string, unknown>): Approval
     ? all.filter((c) => (raw.choices as unknown[]).includes(c))
     : [];
   const text = (v: unknown) => (typeof v === "string" ? v : "");
-  const requestId = text(raw.request_id);
+  // `prompt_id` on /v1/runs events, `request_id` on other surfaces.
+  const requestId = text(raw.request_id) || text(raw.prompt_id);
   const generation = raw.execution_generation;
   return {
     command: text(raw.command),

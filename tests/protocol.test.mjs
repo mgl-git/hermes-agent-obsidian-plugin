@@ -247,3 +247,8 @@ test("runStopBody uses admission id and generation when present", () => {
   assert.deepEqual(runStopBody({ admission_id: "a1", execution_generation: 4, status: "started" }), { admission_id: "a1", execution_generation: 4 });
   assert.equal(runStopBody({ status: "completed" }), undefined);
 });
+
+test("approvalRequestFromEvent reads prompt_id from /v1/runs events", () => {
+  const r = approvalRequestFromEvent({ event: "approval.request", prompt_id: "abc", execution_generation: 3, command: "rm -rf X", choices: ["once", "deny"] });
+  assert.deepEqual(approvalResponseBody(r, "once"), { request_id: "abc", execution_generation: 3, choice: "once" });
+});

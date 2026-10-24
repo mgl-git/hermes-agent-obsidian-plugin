@@ -159,7 +159,7 @@ function approvalRequestFromEvent(raw) {
   const all = ["once", "session", "always", "deny"];
   const offered = Array.isArray(raw.choices) ? all.filter((c) => raw.choices.includes(c)) : [];
   const text = (v) => typeof v === "string" ? v : "";
-  const requestId = text(raw.request_id);
+  const requestId = text(raw.request_id) || text(raw.prompt_id);
   const generation = raw.execution_generation;
   return {
     command: text(raw.command),
