@@ -180,6 +180,14 @@ function profileBaseUrl(baseUrl, profile) {
   const name = (profile || "").trim().replace(/^\/+|\/+$/g, "").replace(/^p\//, "");
   return name ? `${base}/p/${encodeURIComponent(name)}` : base;
 }
+function runStopBody(run) {
+  const admission = run.admission_id;
+  const generation = run.execution_generation;
+  if (typeof admission === "string" && admission && typeof generation === "number" && Number.isInteger(generation)) {
+    return { admission_id: admission, execution_generation: generation };
+  }
+  return void 0;
+}
 export {
   CONTEXT_WINDOW_DEFAULT,
   approvalRequestFromEvent,
@@ -197,6 +205,7 @@ export {
   profileBaseUrl,
   runCompletedUsage,
   runEventReasoningText,
+  runStopBody,
   sanitizeProfileName,
   supportsRunsTransport,
   toolEventFromRunEvent

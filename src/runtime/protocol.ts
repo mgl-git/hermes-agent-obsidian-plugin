@@ -323,3 +323,13 @@ export function profileBaseUrl(baseUrl: string, profile: string | undefined): st
   const name = (profile || "").trim().replace(/^\/+|\/+$/g, "").replace(/^p\//, "");
   return name ? `${base}/p/${encodeURIComponent(name)}` : base;
 }
+
+/** Body for POST /v1/runs/{id}/stop, built from GET /v1/runs/{id}. */
+export function runStopBody(run: Record<string, unknown>): Record<string, unknown> | undefined {
+  const admission = run.admission_id;
+  const generation = run.execution_generation;
+  if (typeof admission === "string" && admission && typeof generation === "number" && Number.isInteger(generation)) {
+    return { admission_id: admission, execution_generation: generation };
+  }
+  return undefined;
+}

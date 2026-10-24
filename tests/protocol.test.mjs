@@ -24,7 +24,8 @@ import {
   sanitizeProfileName,
   profileBaseUrl,
   approvalRequestFromEvent,
-  approvalResponseBody
+  approvalResponseBody,
+  runStopBody
 } from "./.build/protocol.mjs";
 
 test("parseSseBlock parses data-only blocks with CRLF", () => {
@@ -240,4 +241,9 @@ test("approvalResponseBody matches the gateway mode", () => {
   const legacy = approvalRequestFromEvent({ command: "rm -rf x" });
   assert.deepEqual(approvalResponseBody(legacy, "always"), { choice: "always", resolve_all: true });
   assert.deepEqual(approvalResponseBody(null, "deny"), { choice: "deny", resolve_all: false });
+});
+
+test("runStopBody uses admission id and generation when present", () => {
+  assert.deepEqual(runStopBody({ admission_id: "a1", execution_generation: 4, status: "started" }), { admission_id: "a1", execution_generation: 4 });
+  assert.equal(runStopBody({ status: "completed" }), undefined);
 });

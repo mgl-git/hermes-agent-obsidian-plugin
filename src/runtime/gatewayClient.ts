@@ -30,6 +30,7 @@ import {
   ApprovalRequest,
   approvalRequestFromEvent,
   approvalResponseBody,
+  runStopBody,
   parseSseBlock,
   profileBaseUrl,
   runCompletedUsage,
@@ -506,6 +507,7 @@ export class HermesGatewayClient {
     let runId = "";
     let hasContent = false;
     let fellBack = false;
+    let finishedRun = false;
     // Set while the user is answering an approval prompt: an idle timeout of
     // the event stream during that wait is expected and reopens the stream.
     let awaitingApproval = false;
@@ -519,6 +521,7 @@ export class HermesGatewayClient {
 
     const handleEvent = (raw: Record<string, unknown>) => {
       const name = typeof raw.event === "string" ? raw.event : "";
+      if (name === "run.completed" || name === "run.failed" || name === "run.cancelled") finishedRun = true;
       if (name === "message.delta") {
         const delta = typeof raw.delta === "string" ? raw.delta : "";
         if (delta) {
@@ -604,7 +607,7 @@ export class HermesGatewayClient {
           return;
         }
         // Manual mode without an approval UI: cancel + fall back to a plain reply.
-        if (runId) this.postRunStop(apiUrl, runId);
+        if (runId) void this.postRunStop(apiUrl, runId);
         fallback();
         return;
       }
@@ -705,6 +708,14 @@ export class HermesGatewayClient {
               fallback();
               return;
             }
+            // Stopping in the UI must also stop the run on the gateway; otherwise
+            // a run waiting for approval blocks the session's next message.
+            const startedRun = runId;
+            reqs.push({
+              destroy: () => {
+                if (!finishedRun) void this.postRunStop(apiUrl, startedRun);
+              }
+            });
             openEventStream(runId);
           },
           onError: (err: Error) => {
@@ -733,9 +744,27 @@ export class HermesGatewayClient {
     }
   }
 
-  private postRunStop(apiUrl: string, runId: string): void {
-    this.postQuietly(`${apiUrl}/v1/runs/${encodeURIComponent(runId)}/stop`);
+  /**
+   * Stop a run on the gateway. Gateways running the session authority accept
+   * exactly {admission_id, execution_generation} (read from GET /v1/runs/{id});
+   * older gateways take an empty body.
+   */
+  private async postRunStop(apiUrl: string, runId: string): Promise<void> {
+    const runUrl = `${apiUrl}/v1/runs/${encodeURIComponent(runId)}`;
+    let body: Record<string, unknown> | undefined;
+    try {
+      const res = await requestOnce(this.transport, runUrl, {
+        method: "GET",
+        headers: { ...this.authHeaders() },
+        timeoutMs: 10000
+      });
+      if (res.status === 200) body = runStopBody(JSON.parse(res.body) as Record<string, unknown>);
+    } catch {
+      /* fall back to an empty body */
+    }
+    this.postQuietly(`${runUrl}/stop`, body);
   }
+
 
   /**
    * Answer a pending tool-approval request for a run. Resolves with an error
